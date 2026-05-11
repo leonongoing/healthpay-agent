@@ -1,0 +1,15 @@
+{
+  "name": "healthpay-0g-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js bridge for 0G Storage SDK — used by HealthPay Agent",
+  "main": "0g-bridge.js",
+  "scripts": {
+    "upload": "node 0g-bridge.js upload",
+    "download": "node 0g-bridge.js download"
+  },
+  "dependencies": {
+    "@0gfoundation/0g-ts-sdk": "^1.2.1",
+    "ethers": "^6.13.0"
+  }
+}

@@ -1,0 +1,196 @@
+# HealthPay Reconciliation Agent 🏥💰
+
+> AI-powered healthcare payment reconciliation via FHIR R4 — with verifiable audit trails on [0G Network](https://0g.ai/).
+>
+> 🏆 Built for the [0G APAC Hackathon](https://0g.ai/) (Verifiable Finance Track) and [Agents Assemble Hackathon](https://agents-assemble.devpost.com/)
+
+## The Problem
+
+Healthcare organizations in the US lose **$262 billion annually** to administrative waste. A major contributor: the painful, manual process of reconciling medical claims against insurance payments. Staff spend hours cross-referencing Explanation of Benefits (EOBs) with submitted claims, chasing denials, and guessing which claims need attention first.
+
+## The Solution
+
+**HealthPay** is an MCP (Model Context Protocol) server that connects to any FHIR R4-compliant EHR system and provides AI-powered financial intelligence tools. It turns raw claims data into actionable insights — automatically.
+
+### What It Does
+
+| Tool | Description |
+|------|-------------|
+| `reconcile_claims` | Matches Claims against EOBs, identifies denials, partial payments, and overpayments |
+| `analyze_denials` | Classifies denial root causes (CARC codes), generates prioritized appeal strategies with estimated recovery |
+| `generate_ar_report` | Produces Financial Vital Signs dashboard — aging buckets, collection rates, payer performance |
+| `predict_payment_risk` | Scores claims by payment probability using payer history, claim type, and amount patterns |
+| `suggest_coding_optimization` | Identifies ICD-10/CPT coding issues that cause denials — specificity, modifiers, documentation gaps |
+
+### Financial Vital Signs (Sample Output)
+
+```
+Total Billed:      $1,006,189.62
+Total Collected:   $  749,476.36
+Total Outstanding: $  256,713.26
+Collection Rate:          74.5%
+Clean Claim Rate:         50.3%
+Denial Rate:              45.6%
+
+A/R Aging:
+  0-30 days:   $      0.00 (  0.0%)
+  31-60 days:  $    364.23 (  0.1%)
+  120+ days:   $309,928.12 ( 99.9%) ████████████████████████
+```
+
+## 0G Network Integration
+
+HealthPay integrates **two** 0G core components for verifiable healthcare finance:
+
+### 0G Storage — Immutable Audit Trails
+Every reconciliation result is uploaded to 0G decentralized storage via `src/zero_g_storage.py` + `scripts/0g-bridge.js`. The Merkle root hash provides cryptographic proof of data integrity — auditors can independently verify any result.
+
+### 0G Compute — Verifiable AI Inference
+AI-powered denial analysis and risk prediction run on 0G's decentralized compute network via `src/zero_g_compute.py` (using `python-0g` SDK). Execution attestation proves the model actually processed the data.
+
+### Environment Variables
+
+```bash
+# 0G Storage
+ZG_PRIVATE_KEY=<ethereum-private-key>
+ZG_EVM_RPC=https://evmrpc-testnet.0g.ai
+ZG_INDEXER_RPC=https://indexer-storage-testnet-turbo.0g.ai
+
+# 0G Compute
+ZG_COMPUTE_PRIVATE_KEY=<ethereum-private-key>
+ZG_COMPUTE_MODEL=deepseek-chat-v3-0324
+
+# Fallback (when 0G unavailable)
+OPENAI_API_KEY=<openai-key>
+```
+
+Both modules implement graceful degradation — the system works without 0G configured (mock hashes / OpenAI fallback) and is production-ready for 0G mainnet.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│              HealthPay MCP Server                │
+│                                                  │
+│  5 Tools: reconcile | denials | ar_report        │
+│           risk | coding                          │
+│                                                  │
+│  SHARP Context: patient_id + FHIR URL + token    │
+└──────┬──────────────┬──────────────┬─────────────┘
+       │              │              │
+┌──────▼──────┐ ┌─────▼──────┐ ┌────▼───────────┐
+│ FHIR R4     │ │ 0G Storage │ │ 0G Compute     │
+│ Server      │ │            │ │                │
+│ (HAPI FHIR) │ │ Audit      │ │ AI Inference   │
+│ + Synthea   │ │ Trails     │ │ (DeepSeek V3)  │
+└─────────────┘ └────────────┘ └────────────────┘
+```
+
+## Tech Stack
+
+- **Python 3.11+** — Core language
+- **MCP SDK** — Model Context Protocol server implementation
+- **HAPI FHIR R4** — FHIR-compliant healthcare data server (Docker)
+- **Synthea** — Synthetic patient data generation (59 patients, 8000+ claims)
+- **0G TypeScript SDK** (`@0glabs/0g-ts-sdk`) — Decentralized storage via Node.js bridge
+- **python-0g** (`DormintLab/python-0g`) — OpenAI-compatible 0G Compute client
+- **ethers.js** — Ethereum transaction signing for 0G
+- **Pydantic** — Data validation and serialization
+- **httpx** — Async HTTP client for FHIR API
+
+## FHIR Resources Used
+
+| Resource | Purpose |
+|----------|---------|
+| `Patient` | Patient demographics |
+| `Claim` | Medical bills submitted to payers |
+| `ExplanationOfBenefit` | Insurance adjudication results |
+| `Coverage` | Insurance coverage details |
+| `Organization` | Payers and providers |
+
+## SHARP Integration
+
+HealthPay uses the SHARP Extension Specs for healthcare context propagation:
+
+```python
+{
+    "patient_id": "1617",           # FHIR Patient reference
+    "fhir_server_url": "http://...", # FHIR R4 endpoint
+    "fhir_access_token": "Bearer ..." # Authentication
+}
+```
+
+Every tool accepts SHARP context, enabling seamless integration within the Prompt Opinion platform's multi-agent ecosystem.
+
+## Quick Start
+
+### Prerequisites
+- Python 3.11+
+- Docker (for HAPI FHIR server)
+- Java 11+ (for Synthea data generation)
+
+### Setup
+
+```bash
+# Clone the repository
+git clone <repo-url>
+cd healthpay-agent
+
+# Start FHIR server
+docker run -d --name healthpay-fhir -p 19911:8080 \
+  -e hapi.fhir.fhir_version=R4 hapiproject/hapi:latest
+
+# Install dependencies
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Generate and import synthetic data
+cd synthea && bash ../scripts/install_synthea.sh
+bash ../scripts/generate_data.sh
+python ../scripts/import_to_fhir.py
+
+# Run MCP server
+python -m src
+```
+
+### Test a Tool
+
+```python
+import asyncio
+from src.fhir_client import FHIRClient
+from src.reconciler import reconcile
+
+async def demo():
+    fhir = FHIRClient(base_url="http://localhost:19911/fhir")
+    claims = await fhir.get_claims("1617")
+    eobs = await fhir.get_eobs("1617")
+    result = reconcile(patient_id="1617", claims=claims, eobs=eobs)
+    print(f"Matched: {result.summary['matched_count']}")
+    print(f"Discrepancies: {result.summary['discrepancy_count']}")
+    await fhir.close()
+
+asyncio.run(demo())
+```
+
+## Why This Matters
+
+1. **Real Pain Point** — US healthcare billing is broken. $262B wasted annually on admin.
+2. **AI Where It Counts** — Not replacing clinicians, but automating financial drudgery.
+3. **Standards-First** — Built on FHIR R4, MCP, and SHARP. No vendor lock-in.
+4. **Actionable Output** — Every tool produces specific, prioritized recommendations with dollar amounts.
+5. **Privacy-Safe** — Uses only synthetic data. No PHI. No clinical decisions.
+
+## Judging Criteria Alignment
+
+- **The AI Factor**: AI-powered denial classification, risk prediction, and coding optimization go far beyond rule-based systems.
+- **Potential Impact**: Addresses a $262B problem. Every healthcare org needs better payment reconciliation.
+- **Feasibility**: Uses established standards (FHIR R4, MCP). Respects data privacy (synthetic data only). No clinical risk.
+
+## License
+
+MIT
+
+## Team
+
+Built by Leon Huang — fintech CTO with 10+ years in payment systems, now applying that expertise to healthcare finance + decentralized infrastructure (0G Network).

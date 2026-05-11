@@ -1,0 +1,699 @@
+"""
+HealthPay Reconciliation Agent — MCP Server
+Healthcare payment reconciliation via FHIR R4 data.
+Built for Agents Assemble Hackathon 2026.
+"""
+
+import asyncio
+import json
+import logging
+from typing import Any, Optional
+
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent
+
+from .config import settings
+from .fhir_client import FHIRClient
+from .sharp_context import SharpContext, extract_sharp_context
+from .reconciler import reconcile, ReconciliationResult
+from .denial_analyzer import analyze_denials, analyze_denials_enhanced, DenialReport
+from .ar_reporter import generate_ar_report, generate_ar_report_enhanced, ARReport
+from .compliance_checker import check_compliance_enhanced, ComplianceReport
+from .gemma4_client import Gemma4LLM
+from .risk_predictor import predict_payment_risk, RiskReport
+from .coding_optimizer import suggest_coding_optimization, CodingReport
+from .zero_g_storage import upload_to_0g, ZeroGStorageError
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# MCP Server instance
+app = Server("healthpay-reconciliation-agent")
+
+# Gemma 4 LLM client (optional, for enhanced analysis)
+_gemma4_client = None
+try:
+    _gemma4_client = Gemma4LLM()
+    if _gemma4_client.is_available():
+        logger.info("Gemma 4 client initialized successfully")
+    else:
+        logger.warning("Gemma 4 client not available (missing API key or package)")
+except Exception as e:
+    logger.warning("Failed to initialize Gemma 4 client: %s", e)
+
+
+def _get_fhir_client(ctx: SharpContext) -> FHIRClient:
+    """Create a FHIR client from SHARP context or default settings."""
+    return FHIRClient(
+        base_url=ctx.fhir_server_url or settings.fhir_server_url,
+        access_token=ctx.fhir_access_token or settings.fhir_access_token,
+    )
+
+
+@app.list_tools()
+async def list_tools() -> list[Tool]:
+    return [
+        Tool(
+            name="reconcile_claims",
+            description=(
+                "Reconcile healthcare claims against insurance EOBs (Explanation of Benefits) "
+                "for a patient. Identifies matched payments, unmatched claims, and discrepancies "
+                "including denials, partial payments, and overpayments."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "patient_id": {
+                        "type": "string",
+                        "description": "FHIR Patient resource ID",
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "Start date (YYYY-MM-DD) for claim date range filter",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "End date (YYYY-MM-DD) for claim date range filter",
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "SHARP context with FHIR server URL and access token",
+                        "properties": {
+                            "fhir_server_url": {"type": "string"},
+                            "fhir_access_token": {"type": "string"},
+                            "organization_id": {"type": "string"},
+                        },
+                    },
+                },
+                "required": ["patient_id"],
+            },
+        ),
+        Tool(
+            name="get_server_stats",
+            description=(
+                "Get FHIR server statistics: counts of Patients, Claims, EOBs, "
+                "Coverage, and Organization resources. Useful for verifying data availability."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "context": {
+                        "type": "object",
+                        "description": "SHARP context with FHIR server URL and access token",
+                        "properties": {
+                            "fhir_server_url": {"type": "string"},
+                            "fhir_access_token": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="list_patients",
+            description="List patients available in the FHIR server. Optionally filter by name.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Patient name to search for (optional)",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Max number of patients to return (default 20)",
+                        "default": 20,
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "SHARP context",
+                        "properties": {
+                            "fhir_server_url": {"type": "string"},
+                            "fhir_access_token": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="analyze_denials",
+            description=(
+                "Analyze claim denials for a patient (with optional Gemma 4 enhancement). Classifies denial reasons, "
+                "identifies patterns across payers, and generates prioritized appeal "
+                "recommendations with estimated recovery amounts and strategies."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "patient_id": {
+                        "type": "string",
+                        "description": "FHIR Patient resource ID",
+                    },
+                    "use_gemma4": {
+                        "type": "boolean",
+                        "description": "Use Gemma 4 for enhanced medical reasoning (default: false)",
+                        "default": False,
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "Start date (YYYY-MM-DD) filter",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "End date (YYYY-MM-DD) filter",
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "SHARP context with FHIR server URL and access token",
+                        "properties": {
+                            "fhir_server_url": {"type": "string"},
+                            "fhir_access_token": {"type": "string"},
+                        },
+                    },
+                },
+                "required": ["patient_id"],
+            },
+        ),
+        Tool(
+            name="check_compliance",
+            description=(
+                "Check HIPAA compliance and coding accuracy for a claim (with optional Gemma 4 analysis). "
+                "Validates required fields, code formats (CPT/ICD-10/HCPCS), and documentation completeness. "
+                "Returns compliance report with issues, recommendations, and risk score."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "claim_id": {
+                        "type": "string",
+                        "description": "FHIR Claim resource ID to check",
+                    },
+                    "use_gemma4": {
+                        "type": "boolean",
+                        "description": "Use Gemma 4 for enhanced compliance analysis (default: false)",
+                        "default": False,
+                    },
+                },
+                "required": ["claim_id"],
+            },
+        ),
+        Tool(
+            name="generate_ar_report",
+            description=(
+                "Generate an Accounts Receivable report with Financial Vital Signs. "
+                "Shows aging buckets (0-30/31-60/61-90/91-120/120+ days), payer performance, "
+                "collection rates, denial rates, and actionable recommendations. "
+                "Works across all patients in the FHIR server."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date_from": {
+                        "type": "string",
+                        "description": "Start date (YYYY-MM-DD) for claim date range",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "End date (YYYY-MM-DD) for claim date range",
+                    },
+                    "use_gemma4": {
+                        "type": "boolean",
+                        "description": "Use Gemma 4 for trend analysis and insights (default: false)",
+                        "default": False,
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "SHARP context",
+                        "properties": {
+                            "fhir_server_url": {"type": "string"},
+                            "fhir_access_token": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="predict_payment_risk",
+            description=(
+                "Predict payment risk for a patient's claims based on historical patterns. "
+                "Analyzes payer behavior, claim type, amount, and age to generate risk scores "
+                "and payment probability predictions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "patient_id": {
+                        "type": "string",
+                        "description": "FHIR Patient resource ID",
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "SHARP context",
+                        "properties": {
+                            "fhir_server_url": {"type": "string"},
+                            "fhir_access_token": {"type": "string"},
+                        },
+                    },
+                },
+                "required": ["patient_id"],
+            },
+        ),
+        Tool(
+            name="suggest_coding_optimization",
+            description=(
+                "Analyze claims for ICD-10/CPT coding optimization opportunities. "
+                "Identifies specificity issues, missing modifiers, documentation gaps, "
+                "and generates actionable coding improvement suggestions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "patient_id": {
+                        "type": "string",
+                        "description": "FHIR Patient resource ID",
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "SHARP context",
+                        "properties": {
+                            "fhir_server_url": {"type": "string"},
+                            "fhir_access_token": {"type": "string"},
+                        },
+                    },
+                },
+                "required": ["patient_id"],
+            },
+        ),
+        Tool(
+            name="store_audit_trail",
+            description=(
+                "Store a reconciliation audit trail on 0G decentralized storage. "
+                "Uploads the reconciliation result as an immutable record and returns "
+                "a Merkle root hash as tamper-proof evidence. Use after reconcile_claims "
+                "to create a permanent, verifiable audit trail."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "reconciliation_id": {
+                        "type": "string",
+                        "description": "Reconciliation record ID (patient_id or custom ID)",
+                    },
+                    "patient_id": {
+                        "type": "string",
+                        "description": "FHIR Patient resource ID to reconcile and store",
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "Start date (YYYY-MM-DD) for claim date range filter",
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "End date (YYYY-MM-DD) for claim date range filter",
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "SHARP context with FHIR server URL and access token",
+                        "properties": {
+                            "fhir_server_url": {"type": "string"},
+                            "fhir_access_token": {"type": "string"},
+                        },
+                    },
+                },
+                "required": ["reconciliation_id"],
+            },
+        ),
+    ]
+
+
+@app.call_tool()
+async def call_tool(name: str, arguments: Any) -> list[TextContent]:
+    try:
+        ctx = extract_sharp_context(arguments or {})
+        fhir = _get_fhir_client(ctx)
+
+        try:
+            if name == "reconcile_claims":
+                return await _handle_reconcile(fhir, arguments)
+            elif name == "get_server_stats":
+                return await _handle_stats(fhir)
+            elif name == "predict_payment_risk":
+                return await _handle_risk_prediction(fhir, arguments)
+            elif name == "suggest_coding_optimization":
+                return await _handle_coding_optimization(fhir, arguments)
+            elif name == "generate_ar_report":
+                return await _handle_ar_report(fhir, arguments)
+            elif name == "analyze_denials":
+                return await _handle_analyze_denials(fhir, arguments)
+            elif name == "check_compliance":
+                return await _handle_check_compliance(fhir, arguments)
+            elif name == "list_patients":
+                return await _handle_list_patients(fhir, arguments)
+            elif name == "store_audit_trail":
+                return await _handle_store_audit_trail(fhir, arguments)
+            else:
+                return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+        finally:
+            await fhir.close()
+
+    except Exception as e:
+        logger.exception(f"Error in tool {name}")
+        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+
+async def _handle_reconcile(fhir: FHIRClient, arguments: dict) -> list[TextContent]:
+    """Handle reconcile_claims tool call."""
+    patient_id = arguments["patient_id"]
+    date_from = arguments.get("date_from")
+    date_to = arguments.get("date_to")
+
+    date_range_str = None
+    if date_from or date_to:
+        date_range_str = f"{date_from or '...'} to {date_to or '...'}"
+
+    # Fetch FHIR data
+    claims = await fhir.get_claims(patient_id, date_from, date_to)
+    eobs = await fhir.get_eobs(patient_id, date_from, date_to)
+
+    if not claims and not eobs:
+        return [TextContent(type="text", text=json.dumps({
+            "patient_id": patient_id,
+            "message": "No claims or EOBs found for this patient in the specified date range.",
+            "suggestion": "Verify the patient_id exists. Use list_patients to find valid IDs.",
+        }, indent=2))]
+
+    # Run reconciliation
+    result = reconcile(
+        patient_id=patient_id,
+        claims=claims,
+        eobs=eobs,
+        tolerance_amount=settings.match_tolerance_amount,
+        tolerance_days=settings.match_tolerance_days,
+        date_range=date_range_str,
+    )
+
+    result_dict = result.model_dump()
+
+    # Auto-upload to 0G Storage for audit trail
+    audit_hash = None
+    try:
+        from datetime import datetime, timezone
+        audit_payload = {
+            "audit_type": "reconciliation",
+            "patient_id": patient_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "date_range": date_range_str,
+            "reconciliation_result": result_dict,
+        }
+        filename = f"recon_{patient_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        audit_hash = upload_to_0g(data=audit_payload, filename=filename)
+        result_dict["audit_trail"] = {
+            "storage": "0G Decentralized Storage",
+            "root_hash": audit_hash,
+            "immutable": True,
+        }
+        logger.info("Reconciliation audit trail stored: %s", audit_hash)
+    except Exception as e:
+        logger.warning("Failed to store audit trail on 0G: %s", e)
+        result_dict["audit_trail"] = {"error": str(e)}
+
+    return [TextContent(type="text", text=json.dumps(result_dict, indent=2, default=str))]
+
+
+async def _handle_stats(fhir: FHIRClient) -> list[TextContent]:
+    """Handle get_server_stats tool call."""
+    stats = await fhir.get_server_stats()
+    return [TextContent(type="text", text=json.dumps({
+        "fhir_server": fhir.base_url,
+        "resource_counts": stats,
+    }, indent=2))]
+
+
+async def _handle_list_patients(fhir: FHIRClient, arguments: dict) -> list[TextContent]:
+    """Handle list_patients tool call."""
+    name = arguments.get("name")
+    count = arguments.get("count", 20)
+    patients = await fhir.search_patients(name=name, count=count)
+
+    patient_list = []
+    for p in patients:
+        names = p.get("name", [])
+        display_name = "Unknown"
+        if names:
+            n = names[0]
+            given = " ".join(n.get("given", []))
+            family = n.get("family", "")
+            display_name = f"{given} {family}".strip()
+
+        patient_list.append({
+            "id": p.get("id"),
+            "name": display_name,
+            "gender": p.get("gender"),
+            "birthDate": p.get("birthDate"),
+        })
+
+    return [TextContent(type="text", text=json.dumps({
+        "total_found": len(patient_list),
+        "patients": patient_list,
+    }, indent=2))]
+
+
+async def _handle_risk_prediction(fhir: FHIRClient, arguments: dict) -> list[TextContent]:
+    """Handle predict_payment_risk tool call."""
+    patient_id = arguments["patient_id"]
+    claims = await fhir.get_claims(patient_id)
+    eobs = await fhir.get_eobs(patient_id)
+
+    if not claims:
+        return [TextContent(type="text", text=json.dumps({
+            "patient_id": patient_id,
+            "message": "No claims found for this patient.",
+        }, indent=2))]
+
+    report = predict_payment_risk(
+        target_claims=claims, historical_claims=claims,
+        historical_eobs=eobs, patient_id=patient_id,
+    )
+    return [TextContent(type="text", text=json.dumps(report.model_dump(), indent=2, default=str))]
+
+
+async def _handle_coding_optimization(fhir: FHIRClient, arguments: dict) -> list[TextContent]:
+    """Handle suggest_coding_optimization tool call."""
+    patient_id = arguments["patient_id"]
+    claims = await fhir.get_claims(patient_id)
+    eobs = await fhir.get_eobs(patient_id)
+
+    if not claims:
+        return [TextContent(type="text", text=json.dumps({
+            "patient_id": patient_id,
+            "message": "No claims found for this patient.",
+        }, indent=2))]
+
+    report = suggest_coding_optimization(patient_id=patient_id, claims=claims, eobs=eobs)
+    return [TextContent(type="text", text=json.dumps(report.model_dump(), indent=2, default=str))]
+
+
+async def _handle_ar_report(fhir: FHIRClient, arguments: dict) -> list[TextContent]:
+    """Handle generate_ar_report tool call."""
+    date_from = arguments.get("date_from")
+    date_to = arguments.get("date_to")
+    use_gemma4 = arguments.get("use_gemma4", False)
+
+    # Fetch all claims and EOBs (no patient filter for org-wide report)
+    claims = await fhir.search_all("Claim", date_from, date_to)
+    eobs = await fhir.search_all("ExplanationOfBenefit", date_from, date_to)
+
+    if not claims:
+        return [TextContent(type="text", text=json.dumps({
+            "message": "No claims found in the specified date range.",
+        }, indent=2))]
+
+    # Use enhanced version if Gemma 4 requested
+    if use_gemma4:
+        report = await generate_ar_report_enhanced(
+            claims=claims,
+            eobs=eobs,
+            report_date=date_from,
+            use_gemma4=True,
+            gemma4_client=_gemma4_client,
+        )
+    else:
+        report = generate_ar_report(claims=claims, eobs=eobs, report_date=date_from)
+    
+    return [TextContent(type="text", text=json.dumps(report.model_dump(), indent=2, default=str))]
+
+
+async def _handle_analyze_denials(fhir: FHIRClient, arguments: dict) -> list[TextContent]:
+    """Handle analyze_denials tool call."""
+    patient_id = arguments["patient_id"]
+    date_from = arguments.get("date_from")
+    date_to = arguments.get("date_to")
+    use_gemma4 = arguments.get("use_gemma4", False)
+
+    claims = await fhir.get_claims(patient_id, date_from, date_to)
+    eobs = await fhir.get_eobs(patient_id, date_from, date_to)
+
+    if not claims and not eobs:
+        return [TextContent(type="text", text=json.dumps({
+            "patient_id": patient_id,
+            "message": "No claims or EOBs found for this patient.",
+        }, indent=2))]
+
+    # Use enhanced version if Gemma 4 requested
+    if use_gemma4:
+        report = await analyze_denials_enhanced(
+            patient_id=patient_id,
+            claims=claims,
+            eobs=eobs,
+            use_gemma4=True,
+            gemma4_client=_gemma4_client,
+        )
+    else:
+        report = analyze_denials(patient_id=patient_id, claims=claims, eobs=eobs)
+    
+    return [TextContent(type="text", text=json.dumps(report.model_dump(), indent=2, default=str))]
+
+
+
+
+async def _handle_store_audit_trail(fhir: FHIRClient, arguments: dict) -> list[TextContent]:
+    """Handle store_audit_trail tool call.
+
+    Runs reconciliation for the given patient, then uploads the result
+    to 0G decentralized storage as an immutable audit trail.
+    """
+    reconciliation_id = arguments["reconciliation_id"]
+    patient_id = arguments.get("patient_id", reconciliation_id)
+    date_from = arguments.get("date_from")
+    date_to = arguments.get("date_to")
+
+    # Run reconciliation to get the data to store
+    claims = await fhir.get_claims(patient_id, date_from, date_to)
+    eobs = await fhir.get_eobs(patient_id, date_from, date_to)
+
+    if not claims and not eobs:
+        return [TextContent(type="text", text=json.dumps({
+            "reconciliation_id": reconciliation_id,
+            "error": "No claims or EOBs found. Cannot create audit trail.",
+        }, indent=2))]
+
+    result = reconcile(
+        patient_id=patient_id,
+        claims=claims,
+        eobs=eobs,
+        tolerance_amount=settings.match_tolerance_amount,
+        tolerance_days=settings.match_tolerance_days,
+    )
+
+    # Build audit payload
+    from datetime import datetime, timezone
+    audit_payload = {
+        "audit_type": "reconciliation",
+        "reconciliation_id": reconciliation_id,
+        "patient_id": patient_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "date_range": {"from": date_from, "to": date_to},
+        "reconciliation_result": result.model_dump(),
+    }
+
+    # Upload to 0G Storage
+    filename = f"audit_{reconciliation_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+
+    try:
+        root_hash = upload_to_0g(data=audit_payload, filename=filename)
+    except ZeroGStorageError as e:
+        return [TextContent(type="text", text=json.dumps({
+            "reconciliation_id": reconciliation_id,
+            "error": f"0G Storage upload failed: {str(e)}",
+        }, indent=2))]
+
+    response = {
+        "reconciliation_id": reconciliation_id,
+        "patient_id": patient_id,
+        "root_hash": root_hash,
+        "filename": filename,
+        "storage": "0G Decentralized Storage",
+        "immutable": True,
+        "summary": result.summary,
+        "message": (
+            f"Audit trail stored on 0G Storage. "
+            f"Root hash: {root_hash} — this hash serves as tamper-proof evidence."
+        ),
+    }
+
+    return [TextContent(type="text", text=json.dumps(response, indent=2, default=str))]
+
+
+async def _handle_check_compliance(fhir: FHIRClient, arguments: dict) -> list[TextContent]:
+    """Handle check_compliance tool call."""
+    claim_id = arguments.get("claim_id")
+    use_gemma4 = arguments.get("use_gemma4", False)
+    
+    if not claim_id:
+        return [TextContent(type="text", text="Error: claim_id is required")]
+    
+    logger.info("Checking compliance for claim: %s (Gemma 4: %s)", claim_id, use_gemma4)
+    
+    # Fetch claim
+    claim = fhir.get_resource("Claim", claim_id)
+    if not claim:
+        return [TextContent(type="text", text=f"Claim {claim_id} not found")]
+    
+    # Fetch associated EOB (optional)
+    eobs = fhir.search_eobs()
+    eob = None
+    for e in eobs:
+        ref = e.get("claim", {}).get("reference", "")
+        if claim_id in ref:
+            eob = e
+            break
+    
+    # Run compliance check
+    report = await check_compliance_enhanced(
+        claim=claim,
+        eob=eob,
+        use_gemma4=use_gemma4,
+        gemma4_client=_gemma4_client,
+    )
+    
+    # Format response
+    output = f"""# Compliance Report: {claim_id}
+
+**Overall Status:** {report.overall_status.value.upper()}
+**HIPAA Compliant:** {"✅ Yes" if report.hipaa_compliant else "❌ No"}
+**Documentation Score:** {report.documentation_score}%
+
+## Issues Found ({len(report.issues)})
+"""
+    
+    for issue in report.issues:
+        emoji = {"critical": "🔴", "violation": "⚠️", "warning": "🟡", "compliant": "✅"}.get(issue.level.value, "⚪")
+        output += f"\n{emoji} **[{issue.level.value.upper()}] {issue.category}**\n"
+        output += f"   {issue.description}\n"
+        output += f"   → {issue.recommendation}\n"
+        if issue.reference:
+            output += f"   📖 {issue.reference}\n"
+    
+    output += f"\n## Code Validations ({len(report.coding_validations)})\n"
+    for val in report.coding_validations:
+        status = "✅" if val.is_valid else "❌"
+        output += f"\n{status} {val.code_type} {val.code}"
+        if not val.is_valid:
+            output += f" - {val.issue}"
+        output += "\n"
+    
+    if report.recommendations:
+        output += "\n## Recommendations\n"
+        for rec in report.recommendations:
+            output += f"\n- {rec}"
+    
+    return [TextContent(type="text", text=output)]
+
+async def main():
+    """Run the MCP server via stdio transport."""
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(read_stream, write_stream, app.create_initialization_options())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
