@@ -31,7 +31,7 @@ git push origin main
 2. 进入 Settings > Secrets
 3. 添加 Secret：
    - Name: `GEMINI_API_KEY`
-   - Value: `AIzaSyBLgYufRMHIm4miORVz-8nss8HEPETIwsk`
+   - Value: 从 `/home/taomi/projects/healthpay-agent/.env` 里本地复制 `GEMINI_API_KEY`（只填到 Kaggle Secrets，不要提交到 GitHub）
 
 ---
 

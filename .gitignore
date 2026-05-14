@@ -56,3 +56,7 @@ secrets/
 # Synthea large files
 synthea/*.jar
 synthea/output/
+.env.*
+!.env.example
+**/*secret*
+**/*key*
