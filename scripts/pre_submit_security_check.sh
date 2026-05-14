@@ -14,7 +14,9 @@ else
 fi
 
 # 2) staged/tracked files must not contain Google API keys
-if git grep -nE "AIza[0-9A-Za-z_-]{20,}" -- . \':!.env\' >/tmp/healthpay_secret_scan.txt 2>/dev/null; then
+key_prefix="AIz""a"
+key_regex="${key_prefix}[0-9A-Za-z_-]{20,}"
+if git grep -nE "$key_regex" -- . \':!.env\' >/tmp/healthpay_secret_scan.txt 2>/dev/null; then
   echo "❌ Possible Google API key found in tracked files:"
   cat /tmp/healthpay_secret_scan.txt
   fail=1
@@ -23,7 +25,7 @@ else
 fi
 
 # 3) checklist must use placeholder only
-if grep -qE "AIza[0-9A-Za-z_-]{20,}" docs/kaggle-submission-checklist.md; then
+if grep -qE "$key_regex" docs/kaggle-submission-checklist.md; then
   echo "❌ checklist contains raw API key"
   fail=1
 else
