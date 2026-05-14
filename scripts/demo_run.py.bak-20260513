@@ -56,7 +56,7 @@ async def main():
     # Upload to 0G Storage
     print(f"\n  📦 Uploading to 0G Storage...")
     root_hash = upload_to_0g(
-        data=result.model_dump(),
+        data=result.to_dict(),
         filename=f"reconciliation_{pid}.json"
     )
     print(f"  ✅ Merkle Root Hash: {root_hash}")
@@ -64,7 +64,7 @@ async def main():
     
     # Verify download
     print(f"\n  🔍 Verifying 0G Storage integrity...")
-    downloaded = download_from_0g(root_hash, f"/tmp/reconciliation_{pid}_download.json")
+    downloaded = download_from_0g(root_hash)
     if downloaded:
         print(f"  ✅ Data verified: {len(str(downloaded))} bytes")
     else:

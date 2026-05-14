@@ -145,32 +145,45 @@ class Gemma4LLM:
             "max_output_tokens": max_tokens if max_tokens is not None else self.config["max_tokens"],
         }
 
-        # Retry logic for rate limits
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = self._client.models.generate_content(
-                    model=self.model,
-                    contents=contents,
-                    config=config,
-                )
+        # Retry logic with model fallback for transient 500/503 errors
+        fallback_models = [self.model]
+        for alt in ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]:
+            if alt != self.model:
+                fallback_models.append(alt)
 
-                # Convert to OpenAI-compatible format
-                return self._to_openai_format(response, stream=stream)
+        last_error = None
+        for model_attempt, current_model in enumerate(fallback_models):
+            for attempt in range(MAX_RETRIES):
+                try:
+                    response = self._client.models.generate_content(
+                        model=current_model,
+                        contents=contents,
+                        config=config,
+                    )
+                    if model_attempt > 0 or attempt > 0:
+                        logger.info("Succeeded with model=%s attempt=%d", current_model, attempt + 1)
+                    return self._to_openai_format(response, stream=stream)
 
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "rate limit" in error_msg or "quota" in error_msg:
-                    if attempt < MAX_RETRIES - 1:
+                except Exception as e:
+                    last_error = e
+                    error_msg = str(e).lower()
+                    is_transient = (
+                        "rate limit" in error_msg or "quota" in error_msg
+                        or "500" in error_msg or "internal" in error_msg
+                        or "503" in error_msg or "unavailable" in error_msg
+                    )
+                    if is_transient and attempt < MAX_RETRIES - 1:
                         wait_time = RETRY_DELAY * (2 ** attempt)
                         logger.warning(
-                            "Rate limit hit, retrying in %.1fs (attempt %d/%d)",
-                            wait_time, attempt + 1, MAX_RETRIES
+                            "Transient error model=%s, retry %.1fs (%d/%d): %s",
+                            current_model, wait_time, attempt + 1, MAX_RETRIES, str(e)[:80]
                         )
                         await asyncio.sleep(wait_time)
                         continue
-                raise Gemma4Error(f"Gemma 4 API call failed: {e}")
+                    logger.warning("Model %s failed: %s", current_model, str(e)[:80])
+                    break  # try next fallback model
 
-        raise Gemma4Error(f"Gemma 4 API call failed after {MAX_RETRIES} retries")
+        raise Gemma4Error(f"Gemma 4 API call failed after all models/retries: {last_error}")
 
     def _convert_messages(self, messages: list[dict[str, str]]) -> str:
         """
